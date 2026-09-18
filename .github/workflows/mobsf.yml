@@ -1,0 +1,74 @@
+name: MobSF iOS IPA Scan
+on:
+  workflow_call:
+concurrency:
+  group: mobsf-ios-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  mobsf_scan:
+    runs-on: ${{ vars.IOS_RUNNER_IMAGE || 'macos-15' }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+      MOBSF_BASE_URL: ${{ vars.MOBSF_BASE_URL }}
+      IOS_XCODE_CONTAINER: ${{ vars.IOS_XCODE_CONTAINER }}
+      IOS_SCHEME: ${{ vars.IOS_SCHEME }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+      - name: Set up project Ruby
+        if: ${{ vars.IOS_RUBY_VERSION != '' }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ vars.IOS_RUBY_VERSION }}
+          bundler-cache: false
+      - name: Prepare iOS project
+        if: ${{ vars.IOS_SETUP_CMD != '' }}
+        shell: bash
+        env:
+          IOS_SETUP_CMD: ${{ vars.IOS_SETUP_CMD }}
+        run: |
+          set -euo pipefail
+          bash -c "$IOS_SETUP_CMD"
+      - name: Build unsigned IPA for static analysis
+        id: ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          ipa="build/mobsf/App.ipa"
+          bash scripts/build_ios_ipa.sh "$ipa"
+          [[ -f "$ipa" ]] || { echo 'Unsigned IPA build completed without producing build/mobsf/App.ipa.' >&2; exit 1; }
+          echo "path=$ipa" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "$ipa" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Upload IPA and request MobSF static report
+        id: scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${MOBSF_BASE_URL:-http://localhost:8000}"
+          upload="$(curl --fail --silent --show-error -X POST "$base/api/v1/upload" -H "Authorization: $MOBSF_API_KEY" -F "file=@${{ steps.ipa.outputs.path }}")"
+          hash="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hash"])' <<< "$upload")"
+          curl --fail --silent --show-error -X POST "$base/api/v1/scan" -H "Authorization: $MOBSF_API_KEY" -d "hash=$hash" >/dev/null
+          curl --fail --silent --show-error -X POST "$base/api/v1/report_json" -H "Authorization: $MOBSF_API_KEY" -d "hash=$hash" > mobsf_results.json
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+      - name: Write scan metadata
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          json.dump({'platform':'ios','package_type':'ipa','repository':os.environ['GITHUB_REPOSITORY'],
+            'sha':os.environ['GITHUB_SHA'],'ipa_path':'${{ steps.ipa.outputs.path }}',
+            'ipa_sha256':'${{ steps.ipa.outputs.sha256 }}','mobsf_hash':'${{ steps.scan.outputs.hash }}'},
+            open('mobsf_scan_metadata.json','w'), indent=2)
+          PY
+      - name: Upload MobSF IPA report
+        uses: actions/upload-artifact@v6
+        with:
+          name: mobsf-report
+          path: |
+            mobsf_results.json
+            mobsf_scan_metadata.json
+          if-no-files-found: error
